@@ -70,7 +70,16 @@ STRENGTH_MOVEMENTS = {
 
 @st.cache_resource
 def get_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+    url = SUPABASE_URL
+    key = SUPABASE_PUBLISHABLE_KEY
+    if not url or not key:
+        st.error(
+            f"Missing Supabase credentials.\n\n"
+            f"SUPABASE_URL: {'set (' + str(len(url)) + ' chars)' if url else '**MISSING**'}\n\n"
+            f"SUPABASE_PUBLISHABLE_KEY: {'set (' + str(len(key)) + ' chars)' if key else '**MISSING**'}"
+        )
+        st.stop()
+    return create_client(url, key)
 
 
 # ══════════════════════════════════════════════════════════════
