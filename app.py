@@ -361,14 +361,26 @@ def pft_grade(total: int) -> str:
 
 _ALIASES = {
     "lat_pulldown":    ["lat pulldown", "lat pull down", "lat pull-down", "pulldown"],
-    "assisted_pullup": ["assisted pull", "assisted chin"],
-    "pullup":          ["pull up", "pull-up", "pullup", "chin up", "chin-up"],
-    "pullup_negative": ["negative pull", "pull up negative", "pullup negative"],
+    "assisted_pullup": ["assisted pull up", "assisted chin"],
+    "pullup":          ["pull up (bodyweight)"],   # exact Hevy name only
+    "pullup_negative": ["negatiev pull up", "negative pull up", "pull up negative"],
     "bench":           ["bench press", "barbell bench", "flat bench", "bench"],
     "dip":             ["dip"],
     "pushup":          ["push up", "push-up", "pushup"],
     "plank":           ["plank"],
 }
+
+
+def _match(movement: str, aliases: list[str]) -> bool:
+    """
+    Match a movement name against a list of aliases.
+    Single-item alias lists use exact match; multi-item lists use substring match.
+    This prevents broad aliases like "pull up" from catching "assisted pull up".
+    """
+    m = movement.lower().strip()
+    if len(aliases) == 1:
+        return m == aliases[0].lower()
+    return any(a.lower() in m for a in aliases)
 
 
 def _best_1rm(lift_df: pd.DataFrame, key: str, days: int = 90) -> float | None:
@@ -378,7 +390,7 @@ def _best_1rm(lift_df: pd.DataFrame, key: str, days: int = 90) -> float | None:
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
     aliases = _ALIASES[key]
     mask = (
-        lift_df["movement"].str.lower().apply(lambda m: any(a in m for a in aliases))
+        lift_df["movement"].apply(lambda m: _match(m, aliases))
         & (lift_df["date"] >= cutoff)
     )
     sub = lift_df[mask]
@@ -392,7 +404,7 @@ def _best_reps(lift_df: pd.DataFrame, key: str, days: int = 90) -> int | None:
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
     aliases = _ALIASES[key]
     mask = (
-        lift_df["movement"].str.lower().apply(lambda m: any(a in m for a in aliases))
+        lift_df["movement"].apply(lambda m: _match(m, aliases))
         & (lift_df["date"] >= cutoff)
     )
     sub = lift_df[mask]
@@ -409,7 +421,7 @@ def _assisted_effective_1rm(lift_df: pd.DataFrame, bodyweight: float, days: int 
     cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
     aliases = _ALIASES["assisted_pullup"]
     mask = (
-        lift_df["movement"].str.lower().apply(lambda m: any(a in m for a in aliases))
+        lift_df["movement"].apply(lambda m: _match(m, aliases))
         & (lift_df["date"] >= cutoff)
         & (lift_df["weight_lbs"] > 0)
     )
