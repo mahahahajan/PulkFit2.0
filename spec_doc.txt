@@ -1,0 +1,115 @@
+Technical Specification: PulkFit 2.0 Macrocycle OS
+Date: March 21, 2026
+Status: Architecture Approved / Ready for Execution
+
+1. Product Vision
+PulkFit 2.0 is a cloud-native, stateless engineering dashboard designed to track, calculate, and visualize body recomposition and strength metrics. It serves as a strict, data-driven system of record. The interface is highly utilitarian, sleek, and minimal, natively supporting both dark and light OS themes. It requires minimal manual data entry, providing ubiquitous mobile access and automated accountability through data tracking.
+
+2. Core User Stories & Requirements
+Historical Bootstrap: The system must support a one-time, bulk ingestion of at least 6 months of historical data (Fitbit steps/sleep/weight and Hevy workout logs) to establish baseline trends from Day 1.
+
+Ubiquitous Mobile Access: The primary dashboard must be accessible from any mobile browser, displaying 7-day rolling averages and historical trends to drive intra-week motivation without requiring VPNs or local network access.
+
+Dynamic Secondary Metrics: Mobile upload of a Hevy CSV must trigger immediate, stateless recalculations of secondary performance metrics (Estimated 1RM for Squat, Bench, Deadlift, and overall Marine Readiness Score).
+
+Optimized Weekly Sync: The weekly update workflow must not exceed 3 clicks. It must support targeted historical data correction (e.g., overriding specific daily macro totals like 230 kcal / 42g protein entries) and enforce strict deduplication to prevent double-counting workouts.
+
+The Contingency Protocol: The UI must feature a clear, automated "Red/Green" binary indicator comparing current rolling averages against hardcoded macrocycle targets.
+
+3. Architecture & Tech Stack
+The system uses a decoupled, cloud-first stack to prevent state drift, eliminate local network friction, and solve headless OAuth token expiration.
+
+Frontend & Hosting: Streamlit Community Cloud (Python 3.x)
+
+Role: Provides ubiquitous access via the public web.
+
+State Management: Strictly stateless. All metrics are computed on read (or via DB views) to guarantee the dashboard always reflects the exact truth of the underlying database.
+
+Database Layer: Supabase (Serverless PostgreSQL)
+
+Role: Replaces local SQLite. Handles long-term persistence and allows for robust ON CONFLICT DO UPDATE (Upsert) logic to enforce deduplication.
+
+Data Processing: Pandas & SQL
+
+Role: Pandas handles heavy logic (Brzycki 1RM formula) during CSV ingestion. SQL natively handles time-series aggregations (7-day rolling averages) to minimize Streamlit compute overhead.
+
+Authentication & API Automation:
+
+Role: Supabase acts as the persistent token store for Fitbit (and eventually Strava) OAuth2 tokens. Token refresh cycles are handled synchronously upon Streamlit app load, with a UI fallback button for manual re-authorization if the refresh token expires. This replaces fragile GitHub Actions CRON jobs.
+
+4. Core Data Schema (PostgreSQL)
+The foundation relies on three primary tables.
+
+Table 1: daily_metrics
+Tracks daily biometric and nutritional inputs.
+
+date (DATE, Primary Key)
+
+weight_lbs (REAL)
+
+sleep_hours (REAL)
+
+step_count (INTEGER)
+
+calories (INTEGER, nullable)
+
+protein_g (INTEGER, nullable)
+
+Table 2: lifting_log
+Tracks individual sets for progressive overload calculations.
+
+id (UUID, Primary Key)
+
+date (DATE)
+
+movement (VARCHAR)
+
+weight_lbs (REAL)
+
+sets (INTEGER)
+
+reps (INTEGER)
+
+est_1rm (REAL) - Calculated on ingestion
+
+Constraint: Unique composite key on (date, movement) to handle Upserts gracefully.
+
+Table 3: auth_tokens
+Stores OAuth state to keep background API syncs alive.
+
+service (VARCHAR, Primary Key) - e.g., 'fitbit', 'strava'
+
+access_token (TEXT)
+
+refresh_token (TEXT)
+
+expires_at (TIMESTAMP)
+
+5. Execution Roadmap
+Phase 1: The Historical Bootstrap (Local Scripting)
+
+Provision Supabase PostgreSQL instance.
+
+Write local Python script to execute initial Fitbit OAuth flow, paginate through 6 months of historical metrics, and parse the master Hevy CSV.
+
+Bulk-insert cleaned data into Supabase.
+
+Phase 2: Core Dashboard & Cloud Go-Live
+
+Develop app.py connecting directly to Supabase via st.connection.
+
+Build the primary UI: 7-day rolling average metrics and the Red/Green Contingency Protocol logic.
+
+Deploy to Streamlit Community Cloud for read-only global mobile access.
+
+Phase 3: Ingestion & Deduplication Workflows
+
+Implement st.file_uploader for Hevy CSVs with Pandas 1RM calculations and SQL Upsert logic.
+
+Build the manual data correction UI form.
+
+Implement the seamless Fitbit API refresh flow within the Streamlit UI to pull the latest week of steps/sleep on button click.
+
+Phase 4: Extensibility
+
+Integrate Strava API pipeline for endurance tracking using the established token rotation architecture.
