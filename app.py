@@ -272,6 +272,14 @@ def load_rolling_averages() -> pd.DataFrame:
     return df
 
 
+def prev_rolling_avgs(df: pd.DataFrame) -> dict:
+    """Return rolling averages from 7 days ago for week-over-week comparison."""
+    if len(df) < 8:
+        return {}
+    row = df.sort_values("date", ascending=False).iloc[7]
+    return row.to_dict()
+
+
 @st.cache_data(ttl=300)
 def load_lifting_log() -> pd.DataFrame:
     db  = get_supabase()
@@ -302,59 +310,265 @@ def best_1rm(lift_df: pd.DataFrame, movement_aliases: list[str]) -> float | None
 
 
 # ══════════════════════════════════════════════════════════════
-#  Marine Readiness Score
+#  Marine PFT Scoring (Male, Age 26–30)
+#  Max 300 pts total: 100 pull-ups + 100 plank + 100 run
 # ══════════════════════════════════════════════════════════════
 
-def marine_readiness_score(avgs: dict, squat_1rm: float | None,
-                            bench_1rm: float | None, deadlift_1rm: float | None) -> float:
+# Pull-up points table — Male, 26–30
+# reps → points
+_PULLUP_POINTS = {
+    23: 100, 22: 97, 21: 93, 20: 90, 19: 86, 18: 83,
+    17: 79,  16: 76, 15: 72, 14: 69, 13: 65, 12: 62,
+    11: 59,  10: 55,  9: 52,  8: 48,  7: 45,  6: 41,
+     5: 38,   4: 34,  3: 31,  2: 20,  1: 10,  0:  0,
+}
+
+# Plank points table — Male, 26–30
+# duration in seconds → points (sampled at key breakpoints)
+_PLANK_POINTS = [
+    (225, 100), (220, 98), (215, 96), (210, 94), (205, 92),
+    (200, 90),  (195, 88), (190, 86), (185, 84), (180, 82),
+    (175, 80),  (170, 78), (165, 76), (160, 74), (155, 72),
+    (150, 70),  (145, 68), (140, 66), (135, 64), (130, 62),
+    (125, 60),  (120, 58), (115, 56), (110, 54), (105, 52),
+    (100, 50),  ( 95, 48), ( 90, 46), ( 85, 44), ( 80, 42),
+    ( 75, 41),  ( 70, 40), ( 63, 40),             # 1:03 minimum = 40 pts
+]
+
+
+def score_pullups(reps: int) -> int:
+    """Return PFT points for pull-up reps (Male 26–30). Caps at 23 reps."""
+    reps = max(0, min(int(reps), 23))
+    return _PULLUP_POINTS.get(reps, 0)
+
+
+def score_plank(seconds: int) -> int:
+    """Return PFT points for plank duration in seconds (Male 26–30)."""
+    for threshold, pts in _PLANK_POINTS:
+        if seconds >= threshold:
+            return pts
+    return 0  # below 1:03 minimum
+
+
+def pft_grade(total: int) -> str:
+    if total >= 270: return "1st Class"
+    if total >= 235: return "2nd Class"
+    if total >= 200: return "3rd Class"
+    return "Fail"
+
+
+# ── Movement alias lookup ──────────────────────────────────────────────────
+
+_ALIASES = {
+    "lat_pulldown":    ["lat pulldown", "lat pull down", "lat pull-down", "pulldown"],
+    "assisted_pullup": ["assisted pull", "assisted chin"],
+    "pullup":          ["pull up", "pull-up", "pullup", "chin up", "chin-up"],
+    "pullup_negative": ["negative pull", "pull up negative", "pullup negative"],
+    "bench":           ["bench press", "barbell bench", "flat bench", "bench"],
+    "dip":             ["dip"],
+    "pushup":          ["push up", "push-up", "pushup"],
+    "plank":           ["plank"],
+}
+
+
+def _best_1rm(lift_df: pd.DataFrame, key: str, days: int = 90) -> float | None:
+    """Return best est_1rm for a movement group within the past N days."""
+    if lift_df.empty:
+        return None
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+    aliases = _ALIASES[key]
+    mask = (
+        lift_df["movement"].str.lower().apply(lambda m: any(a in m for a in aliases))
+        & (lift_df["date"] >= cutoff)
+    )
+    sub = lift_df[mask]
+    return float(sub["est_1rm"].max()) if not sub.empty else None
+
+
+def _best_reps(lift_df: pd.DataFrame, key: str, days: int = 90) -> int | None:
+    """Return max reps logged for a movement group within the past N days."""
+    if lift_df.empty:
+        return None
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+    aliases = _ALIASES[key]
+    mask = (
+        lift_df["movement"].str.lower().apply(lambda m: any(a in m for a in aliases))
+        & (lift_df["date"] >= cutoff)
+    )
+    sub = lift_df[mask]
+    return int(sub["reps"].max()) if not sub.empty else None
+
+
+def _assisted_effective_1rm(lift_df: pd.DataFrame, bodyweight: float, days: int = 90) -> float | None:
     """
-    Composite 0–100 score across four pillars, 25 pts each:
-      1. Steps    — avg_steps_7d vs TARGET
-      2. Sleep    — avg_sleep_7d vs TARGET
-      3. Strength — (squat + bench + deadlift) vs TARGET total
-      4. Protein  — avg_protein_7d vs TARGET
+    For assisted pull-up machine: weight logged = assistance weight (subtracted from bw).
+    Effective load = bodyweight - assistance. Returns best effective 1RM.
     """
-    def pct(val, target) -> float:
-        if val is None or target == 0:
-            return 0.0
-        return min(float(val) / target, 1.0) * 25
+    if lift_df.empty:
+        return None
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+    aliases = _ALIASES["assisted_pullup"]
+    mask = (
+        lift_df["movement"].str.lower().apply(lambda m: any(a in m for a in aliases))
+        & (lift_df["date"] >= cutoff)
+        & (lift_df["weight_lbs"] > 0)
+    )
+    sub = lift_df[mask].copy()
+    if sub.empty:
+        return None
+    sub["effective_lbs"] = bodyweight - sub["weight_lbs"]
+    sub = sub[sub["effective_lbs"] > 0]
+    if sub.empty:
+        return None
+    # Recalculate 1RM on effective weight
+    sub["eff_1rm"] = sub.apply(
+        lambda r: brzycki_1rm(r["effective_lbs"], int(r["reps"])), axis=1
+    )
+    return float(sub["eff_1rm"].max())
 
-    steps_score   = pct(avgs.get("avg_steps_7d"),  TARGETS["step_count"])
-    sleep_score   = pct(avgs.get("avg_sleep_7d"),  TARGETS["sleep_hours"])
-    protein_score = pct(avgs.get("avg_protein_7d"), TARGETS["protein_g"])
 
-    target_total = TARGETS["squat_1rm"] + TARGETS["bench_1rm"] + TARGETS["deadlift_1rm"]
-    actual_total = (squat_1rm or 0) + (bench_1rm or 0) + (deadlift_1rm or 0)
-    strength_score = pct(actual_total, target_total)
+def estimate_pullup_reps(lift_df: pd.DataFrame, bodyweight: float) -> dict:
+    """
+    Estimate max pull-up reps from multiple strength signals.
+    Returns a dict with per-signal estimates and the final synthesized value.
 
-    return round(steps_score + sleep_score + protein_score + strength_score, 1)
+    Method:
+      - Lat pulldown 1RM / bodyweight ratio → reps via linear model
+        (1RM = 100% bw ≈ 1 rep; each additional 3.5% ≈ +1 rep)
+      - Assisted pull-up effective 1RM / bodyweight → same model
+      - Actual pull-up reps → hard floor
+      - Negative pull-ups → signals capability, adds +1 floor if no reps logged
+      Final = max(all signals), never below actual reps logged.
+    """
+    signals = {}
+
+    lat_1rm = _best_1rm(lift_df, "lat_pulldown", days=90)
+    if lat_1rm is not None and bodyweight > 0:
+        ratio = lat_1rm / bodyweight
+        est   = max(0, int((ratio - 1.0) / 0.035)) if ratio >= 1.0 else 0
+        signals["lat_pulldown"] = {"est": est, "detail": f"1RM {lat_1rm:.0f} lbs = {ratio:.0%} bw"}
+
+    asst_1rm = _assisted_effective_1rm(lift_df, bodyweight, days=90)
+    if asst_1rm is not None and bodyweight > 0:
+        ratio = asst_1rm / bodyweight
+        est   = max(0, int((ratio - 1.0) / 0.035)) if ratio >= 1.0 else 0
+        signals["assisted_pullup"] = {"est": est, "detail": f"effective 1RM {asst_1rm:.0f} lbs = {ratio:.0%} bw"}
+
+    actual_reps = _best_reps(lift_df, "pullup", days=90)
+    if actual_reps is not None:
+        signals["actual_pullup"] = {"est": actual_reps, "detail": f"{actual_reps} reps logged directly"}
+
+    has_negatives = _best_reps(lift_df, "pullup_negative", days=90) is not None
+    if has_negatives and not signals:
+        signals["negatives"] = {"est": 1, "detail": "negatives logged — near pull-up threshold"}
+
+    final = max((v["est"] for v in signals.values()), default=0)
+    return {"reps": final, "signals": signals}
+
+
+def estimate_pushup_reps(lift_df: pd.DataFrame, bodyweight: float) -> dict:
+    """
+    Estimate max push-up reps from bench press and dip strength.
+
+    Method:
+      - Push-up loads ~64% of bodyweight (research-backed constant)
+      - Bench 1RM / (0.64 × bw) = strength ratio
+        ratio 1.0 → ~20 reps; each +0.05 ratio → ~+5 reps (linear approximation)
+      - Bodyweight dip 1RM ≈ pressing bodyweight → cross-validates bench estimate
+      - Actual push-up reps → hard floor
+    """
+    signals = {}
+    pushup_load = 0.64 * bodyweight if bodyweight > 0 else None
+
+    bench_1rm = _best_1rm(lift_df, "bench", days=90)
+    if bench_1rm is not None and pushup_load:
+        ratio = bench_1rm / pushup_load
+        est   = max(0, int(20 + (ratio - 1.0) / 0.05 * 5))
+        signals["bench"] = {"est": est, "detail": f"bench 1RM {bench_1rm:.0f} lbs, push-up load {pushup_load:.0f} lbs ({ratio:.1f}×)"}
+
+    dip_1rm = _best_1rm(lift_df, "dip", days=90)
+    if dip_1rm is not None and pushup_load:
+        # Dips load ~bodyweight; use same ratio model as bench
+        ratio = dip_1rm / pushup_load
+        est   = max(0, int(20 + (ratio - 1.0) / 0.05 * 5))
+        signals["dips"] = {"est": est, "detail": f"dip 1RM {dip_1rm:.0f} lbs vs push-up load {pushup_load:.0f} lbs"}
+
+    actual_reps = _best_reps(lift_df, "pushup", days=90)
+    if actual_reps is not None:
+        signals["actual_pushup"] = {"est": actual_reps, "detail": f"{actual_reps} reps logged directly"}
+
+    final = max((v["est"] for v in signals.values()), default=0)
+    return {"reps": final, "signals": signals}
+
+
+def marine_readiness_score(lift_df: pd.DataFrame, bodyweight: float | None) -> dict:
+    """
+    Compute Marine PFT score using inferred bodyweight-exercise capacity.
+    Pull-up and push-up reps are estimated from weighted lift progressions.
+    Plank uses reps column as seconds (log 90 reps = 90 seconds).
+    Run is stubbed pending Phase 4 Strava integration.
+    """
+    bw = bodyweight or 0.0
+
+    pullup_est = estimate_pullup_reps(lift_df, bw)
+    pushup_est = estimate_pushup_reps(lift_df, bw)
+
+    pullup_reps = pullup_est["reps"]
+    pullup_pts  = score_pullups(pullup_reps)
+
+    plank_secs = _best_reps(lift_df, "plank", days=90)  # reps column = seconds
+    plank_pts  = score_plank(plank_secs) if plank_secs is not None else None
+
+    total = pullup_pts + (plank_pts or 0)
+
+    return {
+        "pullup_reps":    pullup_reps,
+        "pullup_pts":     pullup_pts,
+        "pullup_signals": pullup_est["signals"],
+        "pushup_reps":    pushup_est["reps"],
+        "pushup_signals": pushup_est["signals"],
+        "plank_secs":     plank_secs,
+        "plank_pts":      plank_pts,
+        "run_pts":        None,
+        "total":          total,
+        "total_max":      200,
+        "grade":          pft_grade(total) if (pullup_pts and plank_pts) else "Incomplete",
+    }
 
 
 # ══════════════════════════════════════════════════════════════
 #  UI Components
 # ══════════════════════════════════════════════════════════════
 
-def indicator(label: str, current, target, unit: str = "", lower_is_better: bool = False):
+def indicator(label: str, current, prev, unit: str = "", lower_is_better: bool = False):
     """
     Render a metric tile with a Red / Green status dot.
-    Green = within 5% of target (or past it for weight-loss targets).
+    Green = improved week-over-week, Red = stalled or regressed.
     """
     if current is None or current != current:  # NaN check
         st.metric(label, "—")
         return
 
-    delta_pct = (float(current) - target) / target if target else 0
-    if lower_is_better:
-        green = delta_pct <= 0.05  # at or below target
-    else:
-        green = delta_pct >= -0.05  # within 5% of or above target
-
-    color = "🟢" if green else "🔴"
     formatted = f"{current:,.1f}{unit}" if isinstance(current, float) else f"{int(current):,}{unit}"
-    target_fmt = f"{target:,.1f}{unit}" if isinstance(target, float) else f"{int(target):,}{unit}"
-    delta_str  = f"{delta_pct:+.1%} vs target {target_fmt}"
 
-    st.metric(label=f"{color} {label}", value=formatted, delta=delta_str)
+    if prev is None or prev != prev or prev == 0:
+        # No prior week data — show value without delta
+        st.metric(label=f"⚪ {label}", value=formatted)
+        return
+
+    delta     = float(current) - float(prev)
+    delta_pct = delta / abs(float(prev))
+
+    if lower_is_better:
+        green = delta <= 0
+    else:
+        green = delta >= 0
+
+    color     = "🟢" if green else "🔴"
+    delta_str = f"{delta_pct:+.1%} vs last week"
+
+    st.metric(label=f"{color} {label}", value=formatted, delta=delta_str,
+              delta_color="inverse" if lower_is_better else "normal")
 
 
 def trend_chart(df: pd.DataFrame, col: str, rolling_col: str, title: str, unit: str = ""):
@@ -481,37 +695,75 @@ def page_dashboard():
     squat_1rm    = best_1rm(lift_df, STRENGTH_MOVEMENTS["squat"])
     bench_1rm    = best_1rm(lift_df, STRENGTH_MOVEMENTS["bench"])
     deadlift_1rm = best_1rm(lift_df, STRENGTH_MOVEMENTS["deadlift"])
-    mrs          = marine_readiness_score(avgs, squat_1rm, bench_1rm, deadlift_1rm)
+    recent_bw    = float(avgs["weight_lbs"]) if avgs.get("weight_lbs") else None
+    pft          = marine_readiness_score(lift_df, recent_bw)
+    prev         = prev_rolling_avgs(df)
 
-    # ── Marine Readiness Score banner ─────────────────────────
-    score_color = "#22c55e" if mrs >= 75 else "#f59e0b" if mrs >= 50 else "#ef4444"
+    # ── Marine PFT Score banner ────────────────────────────────
+    total      = pft["total"]
+    total_max  = pft["total_max"]
+    grade      = pft["grade"]
+    grade_color = (
+        "#22c55e" if grade == "1st Class" else
+        "#3b82f6" if grade == "2nd Class" else
+        "#f59e0b" if grade == "3rd Class" else
+        "#ef4444"
+    )
+
+    def _pts(v):
+        return f"{v} pts" if v is not None else "no data"
+
+    def _fmt_plank(s):
+        if s is None: return "no data"
+        return f"{s//60}:{s%60:02d}"
+
     st.markdown(
         f"""<div style='padding:16px 20px;border-radius:10px;
-                border:1px solid {score_color}40;background:{score_color}10;
-                display:flex;align-items:center;gap:16px;margin-bottom:16px'>
-            <span style='font-size:2.4rem;font-weight:500;color:{score_color}'>{mrs}</span>
+                border:1px solid {grade_color}40;background:{grade_color}10;
+                display:flex;align-items:center;gap:24px;margin-bottom:16px;flex-wrap:wrap'>
             <div>
-              <div style='font-size:0.9rem;font-weight:500;color:{score_color}'>Marine Readiness Score</div>
-              <div style='font-size:0.75rem;opacity:0.7'>steps · sleep · protein · strength</div>
+              <div style='font-size:2.4rem;font-weight:500;color:{grade_color};line-height:1'>{total}<span style='font-size:1rem;opacity:0.6'>/{total_max}</span></div>
+              <div style='font-size:0.85rem;font-weight:500;color:{grade_color}'>Marine PFT — {grade}</div>
+              <div style='font-size:0.7rem;opacity:0.6;margin-top:2px'>based on best effort in last 90 days · run score coming in Phase 4</div>
+            </div>
+            <div style='display:flex;gap:20px;flex-wrap:wrap;font-size:0.8rem;opacity:0.85'>
+              <div><b>Pull-ups (est.)</b><br/>{pft["pullup_reps"]} reps → {_pts(pft["pullup_pts"])}</div>
+              <div><b>Plank</b><br/>{_fmt_plank(pft["plank_secs"])} → {_pts(pft["plank_pts"])}</div>
+              <div><b>3mi Run</b><br/>— → Phase 4</div>
             </div>
         </div>""",
         unsafe_allow_html=True,
     )
 
+    # ── PFT signal breakdown ──────────────────────────────────
+    with st.expander("How is the pull-up estimate calculated?"):
+        st.caption(f"Bodyweight used: {recent_bw:.1f} lbs" if recent_bw else "No bodyweight data found.")
+        if pft["pullup_signals"]:
+            for source, info in pft["pullup_signals"].items():
+                st.markdown(f"**{source.replace('_',' ').title()}** — {info['detail']} → **{info['est']} est. reps**")
+        else:
+            st.info("No pull-up related movements found in the last 90 days. Log lat pulldowns, assisted pull-ups, or pull-ups in Hevy.")
+        st.caption("Final estimate = max across all signals. Actual pull-ups logged are always the floor.")
+        if pft["pushup_signals"]:
+            st.divider()
+            st.markdown("**Push-up signals** (for reference):")
+            for source, info in pft["pushup_signals"].items():
+                st.markdown(f"**{source.replace('_',' ').title()}** — {info['detail']} → **{info['est']} est. reps**")
+
     # ── Contingency Protocol ───────────────────────────────────
     st.subheader("Contingency Protocol")
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        indicator("Weight", avgs.get("avg_weight_7d"), TARGETS["weight_lbs"], " lbs",
-                  lower_is_better=True)
+        indicator("Weight",   avgs.get("avg_weight_7d"),   prev.get("avg_weight_7d"),
+                  " lbs", lower_is_better=True)
     with col2:
-        indicator("Sleep",  avgs.get("avg_sleep_7d"),  TARGETS["sleep_hours"], "h")
+        indicator("Sleep",    avgs.get("avg_sleep_7d"),    prev.get("avg_sleep_7d"), "h")
     with col3:
-        indicator("Steps",  avgs.get("avg_steps_7d"),  TARGETS["step_count"])
+        indicator("Steps",    avgs.get("avg_steps_7d"),    prev.get("avg_steps_7d"))
     with col4:
-        indicator("Calories", avgs.get("avg_calories_7d"), TARGETS["calories"], " kcal")
+        indicator("Calories", avgs.get("avg_calories_7d"), prev.get("avg_calories_7d"), " kcal")
     with col5:
-        indicator("Protein", avgs.get("avg_protein_7d"), TARGETS["protein_g"], "g")
+        indicator("Protein",  avgs.get("avg_protein_7d"),  prev.get("avg_protein_7d"), "g")
 
     st.divider()
 
@@ -535,11 +787,11 @@ def page_dashboard():
     st.subheader("Strength Progression")
     col_s, col_b, col_d = st.columns(3)
     with col_s:
-        indicator("Squat 1RM",    squat_1rm,    TARGETS["squat_1rm"],    " lbs")
+        st.metric("Squat 1RM",    f"{squat_1rm:.0f} lbs"    if squat_1rm    else "—")
     with col_b:
-        indicator("Bench 1RM",    bench_1rm,    TARGETS["bench_1rm"],    " lbs")
+        st.metric("Bench 1RM",    f"{bench_1rm:.0f} lbs"    if bench_1rm    else "—")
     with col_d:
-        indicator("Deadlift 1RM", deadlift_1rm, TARGETS["deadlift_1rm"], " lbs")
+        st.metric("Deadlift 1RM", f"{deadlift_1rm:.0f} lbs" if deadlift_1rm else "—")
 
     s1, s2, s3 = st.columns(3)
     with s1:
