@@ -39,7 +39,7 @@ SUPABASE_URL         = os.environ["SUPABASE_URL"]
 SUPABASE_SECRET_KEY  = os.environ["SUPABASE_SECRET_KEY"]
 FITBIT_CLIENT_ID    = os.environ["FITBIT_CLIENT_ID"]
 FITBIT_CLIENT_SECRET = os.environ["FITBIT_CLIENT_SECRET"]
-FITBIT_REDIRECT_URI = "http://localhost:8765/callback"
+FITBIT_REDIRECT_URI = "http://localhost:8081/"
 FITBIT_SCOPE        = "weight sleep activity"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
@@ -67,7 +67,7 @@ class _OAuthHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(400)
             self.end_headers()
-            self.wfile.write(b"<h2>Error — no code in redirect. Try again.</h2>")
+            self.wfile.write(b"<h2>Error: no code in redirect. Try again.</h2>")
 
     def log_message(self, *args):
         pass  # suppress server logs
@@ -78,20 +78,26 @@ def fitbit_oauth() -> dict:
     Open Fitbit authorization in browser, spin up a local server to capture
     the redirect, then exchange the code for tokens. Returns the token dict.
     """
+    base_params = urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id":     FITBIT_CLIENT_ID,
+        "scope":         FITBIT_SCOPE,
+        "expires_in":    "604800",
+    })
     auth_url = (
-        "https://www.fitbit.com/oauth2/authorize"
-        f"?response_type=code"
-        f"&client_id={FITBIT_CLIENT_ID}"
-        f"&redirect_uri={urllib.parse.quote(FITBIT_REDIRECT_URI)}"
-        f"&scope={urllib.parse.quote(FITBIT_SCOPE)}"
-        f"&expires_in=604800"
+        f"https://www.fitbit.com/oauth2/authorize?{base_params}"
+        f"&redirect_uri={FITBIT_REDIRECT_URI}"
     )
 
     print("\n📡  Opening Fitbit authorization in your browser...")
     print(f"    If it doesn't open automatically, visit:\n    {auth_url}\n")
 
-    server = HTTPServer(("localhost", 8765), _OAuthHandler)
-    thread = Thread(target=server.handle_request)
+    def _serve_until_code():
+        while not _auth_code:
+            server.handle_request()
+
+    server = HTTPServer(("localhost", 8081), _OAuthHandler)
+    thread = Thread(target=_serve_until_code)
     thread.start()
     webbrowser.open(auth_url)
     thread.join(timeout=120)
@@ -301,7 +307,12 @@ _BATCH = 500
 def upsert_daily_metrics(df: pd.DataFrame):
     """Upsert daily_metrics rows, replacing on date conflict."""
     print(f"\n⬆️   Upserting {len(df)} rows → daily_metrics")
-    records = df.where(pd.notnull(df), None).to_dict("records")
+    # Convert all NaN/NaT to None so JSON serialization doesn't fail
+    df = df.where(pd.notnull(df), other=None)
+    records = []
+    for row in df.to_dict("records"):
+        records.append({k: (None if isinstance(v, float) and v != v else v)
+                        for k, v in row.items()})
     for i in range(0, len(records), _BATCH):
         batch = records[i : i + _BATCH]
         supabase.table("daily_metrics").upsert(batch, on_conflict="date").execute()
