@@ -70,8 +70,8 @@ STRENGTH_MOVEMENTS = {
 
 @st.cache_resource
 def get_supabase() -> Client:
-    url = SUPABASE_URL
-    key = SUPABASE_PUBLISHABLE_KEY
+    url = SUPABASE_URL.strip().strip('"').strip("'")
+    key = SUPABASE_PUBLISHABLE_KEY.strip().strip('"').strip("'")
     if not url or not key:
         st.error(
             f"Missing Supabase credentials.\n\n"
@@ -201,7 +201,7 @@ def fetch_fitbit_week(access_token: str) -> pd.DataFrame:
         return r.json()
 
     for entry in _get(f"/1/user/-/body/weight/date/{s}/{e}.json").get("body-weight", []):
-        records.setdefault(entry["dateTime"], {})["weight_lbs"] = float(entry["value"])
+        records.setdefault(entry["dateTime"], {})["weight_lbs"] = round(float(entry["value"]) * 2.20462, 1)
 
     for entry in _get(f"/1.2/user/-/sleep/date/{s}/{e}.json").get("sleep", []):
         d     = entry["dateOfSleep"]
@@ -211,6 +211,9 @@ def fetch_fitbit_week(access_token: str) -> pd.DataFrame:
 
     for entry in _get(f"/1/user/-/activities/steps/date/{s}/{e}.json").get("activities-steps", []):
         records.setdefault(entry["dateTime"], {})["step_count"] = int(entry["value"])
+
+    for entry in _get(f"/1/user/-/activities/calories/date/{s}/{e}.json").get("activities-calories", []):
+        records.setdefault(entry["dateTime"], {})["calories"] = int(float(entry["value"]))
 
     rows = [{"date": d, **v} for d, v in records.items()]
     return pd.DataFrame(rows) if rows else pd.DataFrame()
