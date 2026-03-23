@@ -635,14 +635,11 @@ def macrocycle_bar(label: str, current, target: float, unit: str,
     arrow = "▼" if lower_is_better else "▲"
 
     if lower_is_better:
-        # Cutting: bar fills as weight drops toward target
-        # Use target as anchor — show how far above target you still are
         pct = max(0.0, min(1.0, target / val if val > 0 else 0))
-        gap_str = f"{gap:+.1f}{unit} to go" if gap > 0 else f"✓ at target"
+        gap_str = f"{abs(gap):.1f}{unit} to lose" if gap > 0 else "✓ at target"
     else:
-        # Building: bar fills as metric rises toward target
         pct = max(0.0, min(1.0, val / target if target > 0 else 0))
-        gap_str = f"{gap:+.1f}{unit} to go" if gap < 0 else f"✓ at target"
+        gap_str = f"{abs(gap):.1f}{unit} to go" if gap < 0 else "✓ at target"
 
     bar_filled = int(pct * 20)
     bar        = "█" * bar_filled + "░" * (20 - bar_filled)
@@ -850,29 +847,52 @@ def page_dashboard():
         f"Mon–{today_local.strftime('%a %b %d')} · {days_elapsed} day{'s' if days_elapsed > 1 else ''} elapsed"
     )
 
-    w_hits, w_total, _ = weekly_hit_rate(raw_df, "weight_lbs", TARGETS["weight_lbs"], "lte")
-    s_hits, s_total, _ = weekly_hit_rate(raw_df, "sleep_hours", TARGETS["sleep_hours"], "gte")
-    st_hits, st_total, _ = weekly_hit_rate(raw_df, "step_count", TARGETS["step_count"], "gte")
+    def _avg_tile(label, val, target, unit, lower_is_better=False):
+        """Simple 7d average tile. Green = on/past target, red = not there yet."""
+        if val is None or val != val:
+            st.metric(f"⚪ {label}", "—", help=f"Target: {target}{unit}")
+            return
+        v = float(val)
+        on_target = (v <= target) if lower_is_better else (v >= target)
+        color = "🟢" if on_target else "🔴"
+        gap = v - target
+        if lower_is_better:
+            delta_str = f"{abs(gap):.1f}{unit} to lose" if gap > 0 else f"✓ at target"
+        else:
+            delta_str = f"{abs(gap):.1f}{unit} to go" if gap < 0 else f"✓ at target"
+        fmt = f"{v:,.1f}{unit}" if isinstance(v, float) and unit else f"{int(v):,}{unit}"
+        st.metric(label=f"{color} {label} (7d avg)", value=fmt,
+                  delta=delta_str, delta_color="off",
+                  help=f"Target: {'≤' if lower_is_better else '≥'}{target}{unit}")
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        scorecard_tile("Weight", w_hits, w_total, " lbs",
-                       avgs.get("weight_lbs"), TARGETS["weight_lbs"], lower_is_better=True)
+        _avg_tile("Weight", avgs.get("avg_weight_7d"), TARGETS["weight_lbs"], " lbs", lower_is_better=True)
     with col2:
-        scorecard_tile("Sleep", s_hits, s_total, "h",
-                       avgs.get("sleep_hours"), TARGETS["sleep_hours"])
+        _avg_tile("Sleep",  avgs.get("avg_sleep_7d"),  TARGETS["sleep_hours"], "h")
     with col3:
-        scorecard_tile("Steps", st_hits, st_total, "",
-                       avgs.get("step_count"), TARGETS["step_count"])
+        _avg_tile("Steps",  avgs.get("avg_steps_7d"),  TARGETS["step_count"], "")
 
     st.divider()
 
     # ── Macrocycle progress ────────────────────────────────────
     st.subheader("Macrocycle Progress")
     macrocycle_bar("Weight",   avgs.get("avg_weight_7d"),   TARGETS["weight_lbs"],   " lbs", lower_is_better=True)
-    macrocycle_bar("Squat",    squat_1rm,                    TARGETS["squat_1rm"],    " lbs")
-    macrocycle_bar("Bench",    bench_1rm,                    TARGETS["bench_1rm"],    " lbs")
-    macrocycle_bar("Deadlift", deadlift_1rm,                 TARGETS["deadlift_1rm"], " lbs")
+    # For strength, also show recent trend (last 30d best vs prior 30d best)
+    def _strength_bar(label, key, aliases, target):
+        current = best_1rm(lift_df, aliases)
+        prior   = best_1rm(
+            lift_df[lift_df["date"] < pd.Timestamp.now() - pd.Timedelta(days=30)], aliases
+        ) if not lift_df.empty else None
+        macrocycle_bar(label, current, target, " lbs")
+        if current and prior and prior > 0:
+            delta = current - prior
+            trend = f"{'▲' if delta >= 0 else '▼'} {abs(delta):.0f} lbs vs 30d ago"
+            st.caption(trend)
+
+    _strength_bar("Squat",    "squat",    STRENGTH_MOVEMENTS["squat"],    TARGETS["squat_1rm"])
+    _strength_bar("Bench",    "bench",    STRENGTH_MOVEMENTS["bench"],    TARGETS["bench_1rm"])
+    _strength_bar("Deadlift", "deadlift", STRENGTH_MOVEMENTS["deadlift"], TARGETS["deadlift_1rm"])
     # PFT macrocycle bar — target 270 (1st Class)
     macrocycle_bar("PFT Score", float(pft["total"]) if pft["total"] else None, 270.0, " pts")
 
