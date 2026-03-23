@@ -829,7 +829,11 @@ def page_sync():
             if df.empty:
                 st.warning("No data returned from Fitbit for the past 7 days.")
             else:
-                records = df.where(pd.notnull(df), None).to_dict("records")
+                df = df.where(pd.notnull(df), other=None)
+                records = [
+                    {k: (None if isinstance(v, float) and v != v else v) for k, v in row.items()}
+                    for row in df.to_dict("records")
+                ]
                 get_supabase().table("daily_metrics").upsert(
                     records, on_conflict="date"
                 ).execute()
