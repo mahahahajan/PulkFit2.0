@@ -583,7 +583,9 @@ def weekly_hit_rate(df: pd.DataFrame, col: str, threshold: float,
     Returns (hits, days_with_data, list_of_bools_per_day).
     direction: "gte" = value >= threshold (sleep, steps), "lte" = value <= threshold (weight).
     """
-    today = pd.Timestamp.now().normalize()
+    import zoneinfo
+    tz         = zoneinfo.ZoneInfo("America/New_York")
+    today      = pd.Timestamp.now(tz=tz).normalize().tz_localize(None)
     week_start = today - pd.Timedelta(days=today.dayofweek)  # Monday
     week_df = df[(df["date"] >= week_start) & (df["date"] <= today)].copy()
     week_df = week_df.dropna(subset=[col])
@@ -620,21 +622,35 @@ def scorecard_tile(label: str, hits: int, total: int, unit: str,
 
 def macrocycle_bar(label: str, current, target: float, unit: str,
                    lower_is_better: bool = False):
-    """Render a macrocycle progress bar with current vs target."""
+    """
+    Render a macrocycle progress bar.
+    Bar fill = how close current is to target as a fraction of target.
+    Shows the gap remaining rather than a misleading percentage.
+    """
     if current is None or current != current:
         st.markdown(f"**{label}** — no data")
         return
-    val = float(current)
-    if lower_is_better:
-        pct = max(0.0, min(1.0, (target / val) if val > 0 else 0))
-    else:
-        pct = max(0.0, min(1.0, val / target if target > 0 else 0))
-    bar_filled = int(pct * 20)
-    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+    val   = float(current)
+    gap   = val - target
     arrow = "▼" if lower_is_better else "▲"
+
+    if lower_is_better:
+        # Cutting: bar fills as weight drops toward target
+        # Use target as anchor — show how far above target you still are
+        pct = max(0.0, min(1.0, target / val if val > 0 else 0))
+        gap_str = f"{gap:+.1f}{unit} to go" if gap > 0 else f"✓ at target"
+    else:
+        # Building: bar fills as metric rises toward target
+        pct = max(0.0, min(1.0, val / target if target > 0 else 0))
+        gap_str = f"{gap:+.1f}{unit} to go" if gap < 0 else f"✓ at target"
+
+    bar_filled = int(pct * 20)
+    bar        = "█" * bar_filled + "░" * (20 - bar_filled)
+
     st.markdown(
-        f"**{label}** &nbsp; `{bar}` &nbsp; {val:.1f}{unit} → {arrow}{target:.0f}{unit} &nbsp; "
-        f"<span style='opacity:0.5'>({pct:.0%})</span>",
+        f"**{label}** &nbsp; `{bar}` &nbsp; "
+        f"{val:.1f}{unit} → {arrow}{target:.0f}{unit} &nbsp; "
+        f"<span style='opacity:0.55'>{gap_str}</span>",
         unsafe_allow_html=True,
     )
 
@@ -822,11 +838,16 @@ def page_dashboard():
     st.subheader("Contingency Protocol")
     raw_df = df.sort_values("date")  # daily_metrics cols available via rolling_averages view
 
-    today     = pd.Timestamp.now()
-    week_start = today - pd.Timedelta(days=today.dayofweek)
+    # Use US Eastern time so the week boundary matches the user's day,
+    # not UTC midnight on the Streamlit Cloud server.
+    import zoneinfo
+    tz        = zoneinfo.ZoneInfo("America/New_York")
+    today_local = pd.Timestamp.now(tz=tz).normalize().tz_localize(None)
+    week_start  = today_local - pd.Timedelta(days=today_local.dayofweek)  # Monday
+    days_elapsed = today_local.dayofweek + 1  # 1 (Mon) … 7 (Sun)
     st.caption(
         f"Week of {week_start.strftime('%b %d')} — "
-        f"showing Mon–{today.strftime('%a %b %d')} ({today.dayofweek + 1} days elapsed)"
+        f"Mon–{today_local.strftime('%a %b %d')} · {days_elapsed} day{'s' if days_elapsed > 1 else ''} elapsed"
     )
 
     w_hits, w_total, _ = weekly_hit_rate(raw_df, "weight_lbs", TARGETS["weight_lbs"], "lte")
