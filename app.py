@@ -47,14 +47,24 @@ FITBIT_REDIRECT_URI  = _env("FITBIT_REDIRECT_URI", "http://localhost:8501/")
 
 # ── Macrocycle targets ─────────────────────────────────────
 TARGETS = {
-    "weight_lbs":   float(_env("TARGET_WEIGHT_LBS",   "185.0")),
-    "sleep_hours":  float(_env("TARGET_SLEEP_HOURS",  "7.5")),
-    "step_count":   int(_env("TARGET_STEP_COUNT",      "10000")),
-    "calories":     int(_env("TARGET_CALORIES",        "2400")),
-    "protein_g":    int(_env("TARGET_PROTEIN_G",       "180")),
+    "weight_lbs":   float(_env("TARGET_WEIGHT_LBS",   "145.0")),
+    "sleep_hours":  float(_env("TARGET_SLEEP_HOURS",  "7.0")),
+    "step_count":   int(_env("TARGET_STEP_COUNT",      "12000")),
+    "calories":     int(_env("TARGET_CALORIES",        "2600")),
+    "protein_g":    int(_env("TARGET_PROTEIN_G",       "150")),
     "squat_1rm":    float(_env("TARGET_SQUAT_1RM",     "315")),
     "bench_1rm":    float(_env("TARGET_BENCH_1RM",     "225")),
     "deadlift_1rm": float(_env("TARGET_DEADLIFT_1RM",  "405")),
+}
+
+# Per-metric daily thresholds for the hit-rate scorecard
+# Weight uses the target as a ceiling (cutting); everything else is a floor.
+HIT_THRESHOLDS = {
+    "weight_lbs":  ("lte", TARGETS["weight_lbs"]),   # ≤ target = hit
+    "sleep_hours": ("gte", TARGETS["sleep_hours"]),   # ≥ target = hit
+    "step_count":  ("gte", TARGETS["step_count"]),
+    "calories":    ("gte", TARGETS["calories"]),
+    "protein_g":   ("gte", TARGETS["protein_g"]),
 }
 
 STRENGTH_MOVEMENTS = {
@@ -278,6 +288,20 @@ def prev_rolling_avgs(df: pd.DataFrame) -> dict:
         return {}
     row = df.sort_values("date", ascending=False).iloc[7]
     return row.to_dict()
+
+
+@st.cache_data(ttl=300)
+def load_this_week() -> pd.DataFrame:
+    """Return raw daily_metrics rows for the current Mon–Sun week."""
+    today    = date.today()
+    monday   = today - timedelta(days=today.weekday())
+    sunday   = monday + timedelta(days=6)
+    db  = get_supabase()
+    res = db.table("daily_metrics").select("*")         .gte("date", monday.isoformat())         .lte("date", sunday.isoformat())         .order("date").execute()
+    df = pd.DataFrame(res.data or [])
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -552,35 +576,67 @@ def marine_readiness_score(lift_df: pd.DataFrame, bodyweight: float | None) -> d
 #  UI Components
 # ══════════════════════════════════════════════════════════════
 
-def indicator(label: str, current, prev, unit: str = "", lower_is_better: bool = False):
+def weekly_hit_rate(df: pd.DataFrame, col: str, threshold: float,
+                    direction: str = "gte") -> tuple[int, int, list]:
     """
-    Render a metric tile with a Red / Green status dot.
-    Green = improved week-over-week, Red = stalled or regressed.
+    For the current ISO week (Mon–today), count how many days hit the threshold.
+    Returns (hits, days_with_data, list_of_bools_per_day).
+    direction: "gte" = value >= threshold (sleep, steps), "lte" = value <= threshold (weight).
     """
-    if current is None or current != current:  # NaN check
-        st.metric(label, "—")
-        return
-
-    formatted = f"{current:,.1f}{unit}" if isinstance(current, float) else f"{int(current):,}{unit}"
-
-    if prev is None or prev != prev or prev == 0:
-        # No prior week data — show value without delta
-        st.metric(label=f"⚪ {label}", value=formatted)
-        return
-
-    delta     = float(current) - float(prev)
-    delta_pct = delta / abs(float(prev))
-
-    if lower_is_better:
-        green = delta <= 0
+    today = pd.Timestamp.now().normalize()
+    week_start = today - pd.Timedelta(days=today.dayofweek)  # Monday
+    week_df = df[(df["date"] >= week_start) & (df["date"] <= today)].copy()
+    week_df = week_df.dropna(subset=[col])
+    if week_df.empty:
+        return 0, 0, []
+    if direction == "gte":
+        hits_series = week_df[col] >= threshold
     else:
-        green = delta >= 0
+        hits_series = week_df[col] <= threshold
+    hits = int(hits_series.sum())
+    return hits, len(week_df), hits_series.tolist()
 
-    color     = "🟢" if green else "🔴"
-    delta_str = f"{delta_pct:+.1%} vs last week"
 
-    st.metric(label=f"{color} {label}", value=formatted, delta=delta_str,
-              delta_color="inverse" if lower_is_better else "normal")
+def scorecard_tile(label: str, hits: int, total: int, unit: str,
+                   avg_val, threshold: float, lower_is_better: bool = False):
+    """
+    Render a hit-rate tile.
+    Green = 5+/7 days on target, Amber = 3-4, Red = 0-2, Grey = no data.
+    """
+    if total == 0:
+        st.metric(f"⚪ {label}", "no data", help=f"Target: {'≤' if lower_is_better else '≥'}{threshold}")
+        return
+
+    color = "🟢" if hits >= 5 else "🟡" if hits >= 3 else "🔴"
+    avg_fmt = f"{avg_val:.1f}{unit}" if avg_val and avg_val == avg_val else "—"
+    st.metric(
+        label=f"{color} {label}",
+        value=f"{hits}/{total} days",
+        delta=f"avg {avg_fmt}",
+        delta_color="off",
+        help=f"Target: {'≤' if lower_is_better else '≥'}{threshold}{unit}. This week Mon–today.",
+    )
+
+
+def macrocycle_bar(label: str, current, target: float, unit: str,
+                   lower_is_better: bool = False):
+    """Render a macrocycle progress bar with current vs target."""
+    if current is None or current != current:
+        st.markdown(f"**{label}** — no data")
+        return
+    val = float(current)
+    if lower_is_better:
+        pct = max(0.0, min(1.0, (target / val) if val > 0 else 0))
+    else:
+        pct = max(0.0, min(1.0, val / target if target > 0 else 0))
+    bar_filled = int(pct * 20)
+    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+    arrow = "▼" if lower_is_better else "▲"
+    st.markdown(
+        f"**{label}** &nbsp; `{bar}` &nbsp; {val:.1f}{unit} → {arrow}{target:.0f}{unit} &nbsp; "
+        f"<span style='opacity:0.5'>({pct:.0%})</span>",
+        unsafe_allow_html=True,
+    )
 
 
 def trend_chart(df: pd.DataFrame, col: str, rolling_col: str, title: str, unit: str = ""):
@@ -762,40 +818,62 @@ def page_dashboard():
             for source, info in pft["pushup_signals"].items():
                 st.markdown(f"**{source.replace('_',' ').title()}** — {info['detail']} → **{info['est']} est. reps**")
 
-    # ── Contingency Protocol ───────────────────────────────────
+    # ── Contingency Protocol — weekly hit rate ────────────────
     st.subheader("Contingency Protocol")
-    col1, col2, col3, col4, col5 = st.columns(5)
+    raw_df = df.sort_values("date")  # daily_metrics cols available via rolling_averages view
+
+    today     = pd.Timestamp.now()
+    week_start = today - pd.Timedelta(days=today.dayofweek)
+    st.caption(
+        f"Week of {week_start.strftime('%b %d')} — "
+        f"showing Mon–{today.strftime('%a %b %d')} ({today.dayofweek + 1} days elapsed)"
+    )
+
+    w_hits, w_total, _ = weekly_hit_rate(raw_df, "weight_lbs", TARGETS["weight_lbs"], "lte")
+    s_hits, s_total, _ = weekly_hit_rate(raw_df, "sleep_hours", TARGETS["sleep_hours"], "gte")
+    st_hits, st_total, _ = weekly_hit_rate(raw_df, "step_count", TARGETS["step_count"], "gte")
+
+    col1, col2, col3 = st.columns(3)
     with col1:
-        indicator("Weight",   avgs.get("avg_weight_7d"),   prev.get("avg_weight_7d"),
-                  " lbs", lower_is_better=True)
+        scorecard_tile("Weight", w_hits, w_total, " lbs",
+                       avgs.get("weight_lbs"), TARGETS["weight_lbs"], lower_is_better=True)
     with col2:
-        indicator("Sleep",    avgs.get("avg_sleep_7d"),    prev.get("avg_sleep_7d"), "h")
+        scorecard_tile("Sleep", s_hits, s_total, "h",
+                       avgs.get("sleep_hours"), TARGETS["sleep_hours"])
     with col3:
-        indicator("Steps",    avgs.get("avg_steps_7d"),    prev.get("avg_steps_7d"))
-    with col4:
-        indicator("Calories", avgs.get("avg_calories_7d"), prev.get("avg_calories_7d"), " kcal")
-    with col5:
-        indicator("Protein",  avgs.get("avg_protein_7d"),  prev.get("avg_protein_7d"), "g")
+        scorecard_tile("Steps", st_hits, st_total, "",
+                       avgs.get("step_count"), TARGETS["step_count"])
+
+    st.divider()
+
+    # ── Macrocycle progress ────────────────────────────────────
+    st.subheader("Macrocycle Progress")
+    macrocycle_bar("Weight",   avgs.get("avg_weight_7d"),   TARGETS["weight_lbs"],   " lbs", lower_is_better=True)
+    macrocycle_bar("Squat",    squat_1rm,                    TARGETS["squat_1rm"],    " lbs")
+    macrocycle_bar("Bench",    bench_1rm,                    TARGETS["bench_1rm"],    " lbs")
+    macrocycle_bar("Deadlift", deadlift_1rm,                 TARGETS["deadlift_1rm"], " lbs")
+    # PFT macrocycle bar — target 270 (1st Class)
+    macrocycle_bar("PFT Score", float(pft["total"]) if pft["total"] else None, 270.0, " pts")
 
     st.divider()
 
     # ── Biometric trends ───────────────────────────────────────
-    st.subheader("7-Day Rolling Trends")
+    st.subheader("Trends")
     c1, c2 = st.columns(2)
     with c1:
-        trend_chart(df.sort_values("date"), "weight_lbs", "avg_weight_7d", "Weight", " lbs")
+        trend_chart(raw_df, "weight_lbs", "avg_weight_7d", "Weight", " lbs")
     with c2:
-        trend_chart(df.sort_values("date"), "sleep_hours", "avg_sleep_7d", "Sleep", "h")
+        trend_chart(raw_df, "sleep_hours", "avg_sleep_7d", "Sleep", "h")
 
     c3, c4 = st.columns(2)
     with c3:
-        trend_chart(df.sort_values("date"), "step_count", "avg_steps_7d", "Steps")
+        trend_chart(raw_df, "step_count", "avg_steps_7d", "Steps")
     with c4:
-        trend_chart(df.sort_values("date"), "protein_g",  "avg_protein_7d", "Protein", "g")
+        trend_chart(raw_df, "calories", "avg_calories_7d", "Calories burned", " kcal")
 
     st.divider()
 
-    # ── Strength metrics ───────────────────────────────────────
+    # ── Strength progression ───────────────────────────────────
     st.subheader("Strength Progression")
     col_s, col_b, col_d = st.columns(3)
     with col_s:
