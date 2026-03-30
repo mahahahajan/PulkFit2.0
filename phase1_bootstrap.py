@@ -178,7 +178,7 @@ def fetch_fitbit_history(access_token: str, months: int) -> pd.DataFrame:
         try:
             data = _fitbit_get(access_token, f"/1/user/-/body/weight/date/{s}/{e}.json")
             for entry in data.get("body-weight", []):
-                records.setdefault(entry["dateTime"], {})["weight_lbs"] = float(entry["value"])
+                records.setdefault(entry["dateTime"], {})["weight_lbs"] = round(float(entry["value"]) * 2.20462, 1)
             print(" w✓", end="", flush=True)
         except Exception as ex:
             print(f" w✗({ex})", end="", flush=True)
@@ -204,6 +204,15 @@ def fetch_fitbit_history(access_token: str, months: int) -> pd.DataFrame:
             print(" st✓", end="", flush=True)
         except Exception as ex:
             print(f" st✗({ex})", end="", flush=True)
+
+        # Calories burned
+        try:
+            data = _fitbit_get(access_token, f"/1/user/-/activities/calories/date/{s}/{e}.json")
+            for entry in data.get("activities-calories", []):
+                records.setdefault(entry["dateTime"], {})["calories"] = int(float(entry["value"]))
+            print(" cal✓", end="", flush=True)
+        except Exception as ex:
+            print(f" cal✗({ex})", end="", flush=True)
 
         print()
         time.sleep(0.4)  # polite rate limit buffer

@@ -780,98 +780,102 @@ def page_dashboard():
     pft          = marine_readiness_score(lift_df, recent_bw)
     prev         = prev_rolling_avgs(df)
 
-    # ── Marine PFT Score banner ────────────────────────────────
-    total      = pft["total"]
-    total_max  = pft["total_max"]
-    grade      = pft["grade"]
-    grade_color = (
-        "#22c55e" if grade == "1st Class" else
-        "#3b82f6" if grade == "2nd Class" else
-        "#f59e0b" if grade == "3rd Class" else
-        "#ef4444"
-    )
+    # Marine PFT section hidden until Phase 4 (run data + plank logging established)
 
-    def _pts(v):
-        return f"{v} pts" if v is not None else "no data"
-
-    def _fmt_plank(s):
-        if s is None: return "no data"
-        return f"{s//60}:{s%60:02d}"
-
-    st.markdown(
-        f"""<div style='padding:16px 20px;border-radius:10px;
-                border:1px solid {grade_color}40;background:{grade_color}10;
-                display:flex;align-items:center;gap:24px;margin-bottom:16px;flex-wrap:wrap'>
-            <div>
-              <div style='font-size:2.4rem;font-weight:500;color:{grade_color};line-height:1'>{total}<span style='font-size:1rem;opacity:0.6'>/{total_max}</span></div>
-              <div style='font-size:0.85rem;font-weight:500;color:{grade_color}'>Marine PFT — {grade}</div>
-              <div style='font-size:0.7rem;opacity:0.6;margin-top:2px'>based on best effort in last 90 days · run score coming in Phase 4</div>
-            </div>
-            <div style='display:flex;gap:20px;flex-wrap:wrap;font-size:0.8rem;opacity:0.85'>
-              <div><b>Pull-ups (est.)</b><br/>{pft["pullup_reps"]} reps → {_pts(pft["pullup_pts"])}</div>
-              <div><b>Plank</b><br/>{_fmt_plank(pft["plank_secs"])} → {_pts(pft["plank_pts"])}</div>
-              <div><b>3mi Run</b><br/>— → Phase 4</div>
-            </div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
-    # ── PFT signal breakdown ──────────────────────────────────
-    with st.expander("How is the pull-up estimate calculated?"):
-        st.caption(f"Bodyweight used: {recent_bw:.1f} lbs" if recent_bw else "No bodyweight data found.")
-        if pft["pullup_signals"]:
-            for source, info in pft["pullup_signals"].items():
-                st.markdown(f"**{source.replace('_',' ').title()}** — {info['detail']} → **{info['est']} est. reps**")
-        else:
-            st.info("No pull-up related movements found in the last 90 days. Log lat pulldowns, assisted pull-ups, or pull-ups in Hevy.")
-        st.caption("Final estimate = max across all signals. Actual pull-ups logged are always the floor.")
-        if pft["pushup_signals"]:
-            st.divider()
-            st.markdown("**Push-up signals** (for reference):")
-            for source, info in pft["pushup_signals"].items():
-                st.markdown(f"**{source.replace('_',' ').title()}** — {info['detail']} → **{info['est']} est. reps**")
-
-    # ── Contingency Protocol — weekly hit rate ────────────────
+    # ── Contingency Protocol ─────────────────────────────────
     st.subheader("Contingency Protocol")
-    raw_df = df.sort_values("date")  # daily_metrics cols available via rolling_averages view
+    raw_df = df.sort_values("date")
 
-    # Use US Eastern time so the week boundary matches the user's day,
-    # not UTC midnight on the Streamlit Cloud server.
     import zoneinfo
-    tz        = zoneinfo.ZoneInfo("America/New_York")
+    tz          = zoneinfo.ZoneInfo("America/New_York")
     today_local = pd.Timestamp.now(tz=tz).normalize().tz_localize(None)
-    week_start  = today_local - pd.Timedelta(days=today_local.dayofweek)  # Monday
-    days_elapsed = today_local.dayofweek + 1  # 1 (Mon) … 7 (Sun)
+    day_num     = today_local.dayofweek + 1        # Mon=1 … Sun=7
+
+    cur_week_start  = today_local - pd.Timedelta(days=today_local.dayofweek)
+    cur_week_end    = today_local
+    last_week_start = cur_week_start  - pd.Timedelta(days=7)
+    last_week_end   = cur_week_start  - pd.Timedelta(days=1)
+    prior_week_start= last_week_start - pd.Timedelta(days=7)
+    prior_week_end  = last_week_start - pd.Timedelta(days=1)
+
     st.caption(
-        f"Week of {week_start.strftime('%b %d')} — "
-        f"Mon–{today_local.strftime('%a %b %d')} · {days_elapsed} day{'s' if days_elapsed > 1 else ''} elapsed"
+        f"{today_local.strftime('%a %b %-d')} — "
+        f"Day {day_num} of current week "
+        f"({cur_week_start.strftime('%a %-m/%-d')} – {cur_week_end.strftime('%a %b %-d')}). "
+        f"Showing average for the last completed week "
+        f"({last_week_start.strftime('%a %-m/%-d')} – {last_week_end.strftime('%a %b %-d')})."
     )
 
-    def _avg_tile(label, val, target, unit, lower_is_better=False):
-        """Simple 7d average tile. Green = on/past target, red = not there yet."""
-        if val is None or val != val:
-            st.metric(f"⚪ {label}", "—", help=f"Target: {target}{unit}")
+    def _week_avg(col, start, end):
+        mask = (raw_df["date"] >= start) & (raw_df["date"] <= end)
+        sub  = raw_df[mask].dropna(subset=[col])
+        return round(float(sub[col].mean()), 2) if not sub.empty else None
+
+    # Last completed week averages
+    lw_weight = _week_avg("weight_lbs",  last_week_start, last_week_end)
+    lw_sleep  = _week_avg("sleep_hours", last_week_start, last_week_end)
+    lw_steps  = _week_avg("step_count",  last_week_start, last_week_end)
+
+    # Prior week averages (for green/red direction comparison)
+    pw_weight = _week_avg("weight_lbs",  prior_week_start, prior_week_end)
+    pw_sleep  = _week_avg("sleep_hours", prior_week_start, prior_week_end)
+    pw_steps  = _week_avg("step_count",  prior_week_start, prior_week_end)
+
+    def _contingency_tile(label, lw_val, pw_val, target, unit, lower_is_better=False):
+        """
+        Show last completed week's average.
+        Green  = trend moving in the right direction vs prior week.
+        Red    = trend moving in the wrong direction.
+        Delta  = change from prior week (not vs target).
+        Help   = distance remaining to goal target.
+        """
+        if lw_val is None:
+            st.metric(f"⚪ {label}", "—")
             return
-        v = float(val)
-        on_target = (v <= target) if lower_is_better else (v >= target)
-        color = "🟢" if on_target else "🔴"
-        gap = v - target
-        if lower_is_better:
-            delta_str = f"{abs(gap):.1f}{unit} to lose" if gap > 0 else f"✓ at target"
+
+        # Direction of change vs prior week
+        if pw_val is not None and pw_val > 0:
+            change = lw_val - pw_val
+            improved = (change <= 0) if lower_is_better else (change >= 0)
+            color = "🟢" if improved else "🔴"
+            if lower_is_better:
+                delta_str = f"{'▼' if change < 0 else '▲'} {abs(change):.1f}{unit} vs prior week"
+            else:
+                delta_str = f"{'▲' if change > 0 else '▼'} {abs(change):.1f}{unit} vs prior week"
+            delta_color = "normal" if improved else "inverse"
         else:
-            delta_str = f"{abs(gap):.1f}{unit} to go" if gap < 0 else f"✓ at target"
-        fmt = f"{v:,.1f}{unit}" if isinstance(v, float) and unit else f"{int(v):,}{unit}"
-        st.metric(label=f"{color} {label} (7d avg)", value=fmt,
-                  delta=delta_str, delta_color="off",
-                  help=f"Target: {'≤' if lower_is_better else '≥'}{target}{unit}")
+            color = "⚪"
+            delta_str = "no prior week data"
+            delta_color = "off"
+
+        # Gap to goal for the help tooltip
+        gap = lw_val - target
+        if lower_is_better:
+            gap_label = f"{abs(gap):.1f}{unit} to lose" if gap > 0 else "✓ at goal"
+        else:
+            gap_label = f"{abs(gap):.1f}{unit} to go" if gap < 0 else "✓ at goal"
+
+        # Format value
+        if unit == "" and isinstance(lw_val, float):
+            fmt = f"{int(round(lw_val)):,}"
+        else:
+            fmt = f"{lw_val:.1f}{unit}"
+
+        st.metric(
+            label=f"{color} {label}",
+            value=fmt,
+            delta=delta_str,
+            delta_color=delta_color,
+            help=f"Goal: {'≤' if lower_is_better else '≥'}{target}{unit} · {gap_label}",
+        )
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        _avg_tile("Weight", avgs.get("avg_weight_7d"), TARGETS["weight_lbs"], " lbs", lower_is_better=True)
+        _contingency_tile("Weight", lw_weight, pw_weight, TARGETS["weight_lbs"], " lbs", lower_is_better=True)
     with col2:
-        _avg_tile("Sleep",  avgs.get("avg_sleep_7d"),  TARGETS["sleep_hours"], "h")
+        _contingency_tile("Sleep",  lw_sleep,  pw_sleep,  TARGETS["sleep_hours"], "h")
     with col3:
-        _avg_tile("Steps",  avgs.get("avg_steps_7d"),  TARGETS["step_count"], "")
+        _contingency_tile("Steps",  lw_steps,  pw_steps,  TARGETS["step_count"],  "")
 
     st.divider()
 
