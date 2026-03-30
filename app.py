@@ -20,6 +20,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -620,12 +621,52 @@ def scorecard_tile(label: str, hits: int, total: int, unit: str,
     )
 
 
-def macrocycle_bar(label: str, current, target: float, unit: str,
-                   lower_is_better: bool = False):
+def project_arrival(df: pd.DataFrame, col: str, target: float,
+                    lower_is_better: bool = True, weeks_lookback: int = 8):
     """
-    Render a macrocycle progress bar.
-    Bar fill = how close current is to target as a fraction of target.
-    Shows the gap remaining rather than a misleading percentage.
+    Fit a linear regression over the last N weeks of weekly averages.
+    Returns (rate_per_week, projected_date | None, status).
+    Status: "ok" | "at_target" | "stalled" | "not enough data"
+    """
+    today  = pd.Timestamp.now().normalize()
+    cutoff = today - pd.Timedelta(weeks=weeks_lookback)
+    sub    = df[df["date"] >= cutoff].dropna(subset=[col]).copy()
+    if len(sub) < 7:
+        return None, None, "not enough data"
+
+    sub["week"] = (sub["date"] - cutoff).dt.days // 7
+    weekly = sub.groupby("week")[col].mean().reset_index()
+    if len(weekly) < 2:
+        return None, None, "not enough data"
+
+    x = weekly["week"].values.astype(float)
+    y = weekly[col].values.astype(float)
+    slope, _ = np.polyfit(x, y, 1)   # lbs (or pts) per week
+
+    current_val = float(y[-1])        # most recent weekly average
+    gap         = current_val - target
+
+    # Already there?
+    if lower_is_better and current_val <= target:
+        return slope, None, "at_target"
+    if not lower_is_better and current_val >= target:
+        return slope, None, "at_target"
+
+    # Moving in the right direction?
+    moving = (slope < 0) if lower_is_better else (slope > 0)
+    if not moving or abs(slope) < 0.01:
+        return slope, None, "stalled"
+
+    weeks_to_go = abs(gap / slope)
+    arrival     = today + pd.Timedelta(days=weeks_to_go * 7)
+    return slope, arrival, "ok"
+
+
+def macrocycle_bar(label: str, current, target: float, unit: str,
+                   lower_is_better: bool = False, arrival: pd.Timestamp = None,
+                   rate: float = None):
+    """
+    Render a macrocycle progress bar with gap and projected arrival date.
     """
     if current is None or current != current:
         st.markdown(f"**{label}** — no data")
@@ -635,19 +676,34 @@ def macrocycle_bar(label: str, current, target: float, unit: str,
     arrow = "▼" if lower_is_better else "▲"
 
     if lower_is_better:
-        pct = max(0.0, min(1.0, target / val if val > 0 else 0))
+        pct     = max(0.0, min(1.0, target / val if val > 0 else 0))
         gap_str = f"{abs(gap):.1f}{unit} to lose" if gap > 0 else "✓ at target"
     else:
-        pct = max(0.0, min(1.0, val / target if target > 0 else 0))
+        pct     = max(0.0, min(1.0, val / target if target > 0 else 0))
         gap_str = f"{abs(gap):.1f}{unit} to go" if gap < 0 else "✓ at target"
 
     bar_filled = int(pct * 20)
     bar        = "█" * bar_filled + "░" * (20 - bar_filled)
 
+    # Projection string
+    if arrival is not None and rate is not None:
+        weeks_left = (arrival - pd.Timestamp.now().normalize()).days / 7
+        proj_str   = (
+            f"&nbsp;·&nbsp; "
+            f"<span style='opacity:0.6'>on track for "
+            f"<b>{arrival.strftime('%b %d, %Y')}</b> "
+            f"({weeks_left:.0f} wks · {abs(rate):.2f}{unit}/wk)</span>"
+        )
+    elif arrival is None and rate is not None and abs(rate) >= 0.01:
+        proj_str = f"&nbsp;·&nbsp; <span style='opacity:0.5'>trend flat — no arrival date</span>"
+    else:
+        proj_str = ""
+
     st.markdown(
         f"**{label}** &nbsp; `{bar}` &nbsp; "
         f"{val:.1f}{unit} → {arrow}{target:.0f}{unit} &nbsp; "
-        f"<span style='opacity:0.55'>{gap_str}</span>",
+        f"<span style='opacity:0.55'>{gap_str}</span>"
+        f"{proj_str}",
         unsafe_allow_html=True,
     )
 
@@ -881,24 +937,43 @@ def page_dashboard():
 
     # ── Macrocycle progress ────────────────────────────────────
     st.subheader("Macrocycle Progress")
-    macrocycle_bar("Weight",   avgs.get("avg_weight_7d"),   TARGETS["weight_lbs"],   " lbs", lower_is_better=True)
-    # For strength, also show recent trend (last 30d best vs prior 30d best)
-    def _strength_bar(label, key, aliases, target):
-        current = best_1rm(lift_df, aliases)
-        prior   = best_1rm(
-            lift_df[lift_df["date"] < pd.Timestamp.now() - pd.Timedelta(days=30)], aliases
-        ) if not lift_df.empty else None
-        macrocycle_bar(label, current, target, " lbs")
-        if current and prior and prior > 0:
-            delta = current - prior
-            trend = f"{'▲' if delta >= 0 else '▼'} {abs(delta):.0f} lbs vs 30d ago"
-            st.caption(trend)
 
-    _strength_bar("Squat",    "squat",    STRENGTH_MOVEMENTS["squat"],    TARGETS["squat_1rm"])
-    _strength_bar("Bench",    "bench",    STRENGTH_MOVEMENTS["bench"],    TARGETS["bench_1rm"])
-    _strength_bar("Deadlift", "deadlift", STRENGTH_MOVEMENTS["deadlift"], TARGETS["deadlift_1rm"])
-    # PFT macrocycle bar — target 270 (1st Class)
-    macrocycle_bar("PFT Score", float(pft["total"]) if pft["total"] else None, 270.0, " pts")
+    # Weight projection — use daily weight from rolling_averages view
+    w_rate, w_arrival, w_status = project_arrival(
+        raw_df, "weight_lbs", TARGETS["weight_lbs"], lower_is_better=True
+    )
+    macrocycle_bar(
+        "Weight", avgs.get("avg_weight_7d"), TARGETS["weight_lbs"], " lbs",
+        lower_is_better=True,
+        arrival=w_arrival if w_status == "ok" else None,
+        rate=w_rate,
+    )
+
+    # Strength projections — use per-movement est_1rm over time
+    def _strength_bar(label, aliases, target):
+        current   = best_1rm(lift_df, aliases)
+        # Build a per-movement time series of best 1RM per day for regression
+        if not lift_df.empty:
+            mask    = lift_df["movement"].str.lower().apply(
+                lambda m: any(a.lower() in m for a in aliases)
+            )
+            mv_df   = lift_df[mask].copy()
+            s_rate, s_arrival, s_status = (
+                project_arrival(mv_df, "est_1rm", target, lower_is_better=False)
+                if not mv_df.empty else (None, None, "not enough data")
+            )
+        else:
+            s_rate, s_arrival, s_status = None, None, "not enough data"
+
+        macrocycle_bar(
+            label, current, target, " lbs",
+            arrival=s_arrival if s_status == "ok" else None,
+            rate=s_rate,
+        )
+
+    _strength_bar("Squat",    STRENGTH_MOVEMENTS["squat"],    TARGETS["squat_1rm"])
+    _strength_bar("Bench",    STRENGTH_MOVEMENTS["bench"],    TARGETS["bench_1rm"])
+    _strength_bar("Deadlift", STRENGTH_MOVEMENTS["deadlift"], TARGETS["deadlift_1rm"])
 
     st.divider()
 
@@ -1053,7 +1128,7 @@ def main():
     st.set_page_config(
         page_title="PulkFit 2.0",
         page_icon="📊",
-        layout="wide",
+        layout="centered",
         initial_sidebar_state="expanded",
     )
 
